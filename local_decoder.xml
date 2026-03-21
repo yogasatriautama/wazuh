@@ -1,0 +1,40 @@
+<!-- Local Decoders -->
+
+<!-- Modify it at your will. -->
+<!-- Copyright (C) 2015, Wazuh Inc. -->
+
+<!--
+  - Allowed static fields:
+  - location   - where the log came from (only on FTS)
+  - srcuser    - extracts the source username
+  - dstuser    - extracts the destination (target) username
+  - user       - an alias to dstuser (only one of the two can be used)
+  - srcip      - source ip
+  - dstip      - dst ip
+  - srcport    - source port
+  - dstport    - destination port
+  - protocol   - protocol
+  - id         - event id
+  - url        - url of the event
+  - action     - event action (deny, drop, accept, etc)
+  - status     - event status (success, failure, etc)
+  - extra_data - Any extra data
+-->
+
+<decoder name="local_decoder_example">
+    <program_name>local_decoder_example</program_name>
+</decoder>
+
+<!-- Decoder for web shell network connection. -->
+<decoder name="network-traffic-child">
+  <parent>ossec</parent>
+  <prematch offset="after_parent">^output: 'webshell connections':</prematch>
+  <regex offset="after_prematch" type="pcre2">(\d+.\d+.\d+.\d+):(\d+)\|(\d+.\d+.\d+.\d+):(\d+)</regex>
+  <order>local_ip, local_port, foreign_ip, foreign_port</order>
+</decoder>
+
+<decoder name="ar_log_json_child">
+    <parent>ar_log_json</parent>
+    <regex offset="after_parent">(\S+) \S+ \S+ (\S+). \S+ \S+ \S+</regex>
+    <order>file_path,quarantined_path</order>
+</decoder>
