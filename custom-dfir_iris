@@ -20,6 +20,9 @@ DEDUP_DB = os.path.join(STATE_DIR, "custom-dfir_iris_dedup.json")
 
 ALLOWED_RULE_IDS = {"100622", "100623"}
 
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+
 
 def log(msg):
     print(f"{LOG_PREFIX}: {msg}", file=sys.stderr, flush=True)
@@ -120,6 +123,43 @@ def extract_user(alert):
         default="-",
         max_len=150,
     )
+
+
+def extract_groups(alert):
+    groups = get_nested(alert, "rule", "groups", default=[])
+    if isinstance(groups, list):
+        return [safe_text(x) for x in groups if safe_text(x) != "-"]
+    if groups:
+        return [safe_text(groups)]
+    return []
+
+
+def extract_best_log(alert, max_len=1200):
+    candidates = [
+        get_nested(alert, "full_log"),
+        get_nested(alert, "data", "win", "eventdata"),
+        get_nested(alert, "data", "eventdata"),
+        get_nested(alert, "data"),
+    ]
+
+    for item in candidates:
+        if not item:
+            continue
+
+        if isinstance(item, str):
+            return safe_text(item.replace("\\n", "\n"), default="-", max_len=max_len)
+
+        if isinstance(item, (dict, list)):
+            try:
+                return safe_text(
+                    json.dumps(item, ensure_ascii=False, indent=2),
+                    default="-",
+                    max_len=max_len
+                )
+            except Exception:
+                pass
+
+    return "-"
 
 
 def build_fingerprint(alert):
@@ -229,6 +269,90 @@ def parse_options(argv):
     return options
 
 
+def telegram_enabled(bot_token, chat_id):
+    return bool(str(bot_token).strip()) and bool(str(chat_id).strip())
+
+
+def escape_html(text):
+    text = str(text if text is not None else "")
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+
+
+def build_telegram_message(alert, case_id, case_name):
+    rule_id = safe_text(get_nested(alert, "rule", "id"), default="unknown")
+    rule_desc = safe_text(get_nested(alert, "rule", "description"), default="No description")
+    level = safe_text(get_nested(alert, "rule", "level"), default="0")
+    groups = extract_groups(alert)
+    groups_text = ", ".join(groups) if groups else "-"
+
+    agent_name = safe_text(get_nested(alert, "agent", "name"), default="unknown-agent")
+    agent_id = safe_text(get_nested(alert, "agent", "id"), default="-")
+    wazuh_alert_id = safe_text(alert.get("id"), default="-")
+    timestamp = safe_text(alert.get("timestamp"), default="-")
+    ioc_value = extract_ioc_value(alert)
+    src_ip = extract_src_ip(alert)
+    dst_ip = extract_dst_ip(alert)
+    username = extract_user(alert)
+    raw_log = extract_best_log(alert, max_len=1200)
+
+    title = rule_desc
+    subtitle = f"DFIR IRIS case created: {case_name}"
+
+    msg = []
+    msg.append(f"<b>Attack:</b> {escape_html(title)}")
+    msg.append(f"<b>Case:</b> {escape_html(subtitle)}")
+    msg.append("")
+
+    if raw_log != "-":
+        msg.append("<b>Log:</b>")
+        msg.append(f"<pre>{escape_html(raw_log)}</pre>")
+
+    msg.append(f"<b>Target / IOC:</b> <code>{escape_html(ioc_value)}</code>")
+    msg.append(f"<b>IP Attacker:</b> <code>{escape_html(src_ip)}</code>")
+    msg.append(f"<b>Dst IP:</b> <code>{escape_html(dst_ip)}</code>")
+    msg.append(f"<b>User:</b> <code>{escape_html(username)}</code>")
+    msg.append(f"<b>Groups:</b> {escape_html(groups_text)}")
+    msg.append(f"<b>Rule:</b> {escape_html(rule_id)} (Level {escape_html(level)})")
+    msg.append(f"<b>Agent:</b> {escape_html(agent_name)} ({escape_html(agent_id)})")
+    msg.append(f"<b>IRIS Case ID:</b> <code>{escape_html(case_id)}</code>")
+    msg.append(f"<b>Wazuh Alert ID:</b> <code>{escape_html(wazuh_alert_id)}</code>")
+    msg.append(f"<b>Time:</b> {escape_html(timestamp)}")
+
+    return "\n".join(msg)
+
+
+def send_telegram_message(bot_token, chat_id, message, verify_ssl):
+    if not telegram_enabled(bot_token, chat_id):
+        log("Telegram disabled: bot token or chat id is empty")
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    r = requests.post(url, json=payload, timeout=30, verify=verify_ssl)
+    if not r.ok:
+        raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"ok": False, "raw_text": r.text}
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {json.dumps(data, ensure_ascii=False)}")
+
+    return True
+
+
 def main():
     if len(sys.argv) < 4:
         log("Usage: custom-dfir_iris <alert_file> <api_key> <hook_url> [options_json]")
@@ -245,6 +369,15 @@ def main():
     dedup_seconds = int(options.get("dedup_seconds", 1800))
     max_case_name_len = int(options.get("max_case_name_len", 180))
 
+    telegram_bot_token = safe_text(
+        options.get("telegram_bot_token"),
+        default=TELEGRAM_BOT_TOKEN
+    )
+    telegram_chat_id = safe_text(
+        options.get("telegram_chat_id"),
+        default=TELEGRAM_CHAT_ID
+    )
+
     alert = load_json(alert_file, default={})
     if not alert:
         log("Alert JSON empty or unreadable")
@@ -260,15 +393,25 @@ def main():
         log(f"Duplicate suppressed: {fingerprint}")
         sys.exit(0)
 
-    rule_desc = safe_text(get_nested(alert, "rule", "description"), default="No description", max_len=120)
-    agent_name = safe_text(get_nested(alert, "agent", "name"), default="unknown-agent", max_len=100)
+    rule_desc = safe_text(
+        get_nested(alert, "rule", "description"),
+        default="No description",
+        max_len=120
+    )
+    agent_name = safe_text(
+        get_nested(alert, "agent", "name"),
+        default="unknown-agent",
+        max_len=100
+    )
     ioc_value = extract_ioc_value(alert)
     wazuh_alert_id = safe_text(alert.get("id"), default=f"{rule_id}-{int(time.time())}")
+
+    case_name = build_case_name(rule_desc, agent_name, ioc_value, max_case_name_len)
 
     case_payload = {
         "case_soc_id": wazuh_alert_id,
         "case_customer": customer_id,
-        "case_name": build_case_name(rule_desc, agent_name, ioc_value, max_case_name_len),
+        "case_name": case_name,
         "case_description": build_case_description(alert),
     }
 
@@ -294,6 +437,22 @@ def main():
             sys.exit(1)
 
         log(f"Case created successfully. case_id={case_id}")
+
+        if telegram_enabled(telegram_bot_token, telegram_chat_id):
+            try:
+                telegram_message = build_telegram_message(alert, case_id, case_name)
+                send_telegram_message(
+                    telegram_bot_token,
+                    telegram_chat_id,
+                    telegram_message,
+                    verify_ssl
+                )
+                log("Telegram notification sent successfully")
+            except Exception as tg_err:
+                log(f"Telegram notification failed: {tg_err}")
+        else:
+            log("Telegram notification skipped (token/chat_id not set)")
+
         sys.exit(0)
 
     except requests.HTTPError as e:
