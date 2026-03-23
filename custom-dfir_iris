@@ -1,181 +1,308 @@
 #!/var/ossec/framework/python/bin/python3
+# -*- coding: utf-8 -*-
+
+import os
 import sys
 import json
-import requests
-import ipaddress
-import logging
+import time
 import hashlib
-import os
+import tempfile
 from datetime import datetime
 
-LOG_FILE = "/var/ossec/logs/integrations.log"
-DEDUP_DIR = "/var/ossec/var/run/abuseipdb-report-cache"
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-os.makedirs(DEDUP_DIR, exist_ok=True)
+LOG_PREFIX = "custom-dfir_iris"
+STATE_DIR = "/var/ossec/tmp"
+DEDUP_DB = os.path.join(STATE_DIR, "custom-dfir_iris_dedup.json")
+
+ALLOWED_RULE_IDS = {"100622", "100623"}
 
 
-def is_public_ip(ip):
+def log(msg):
+    print(f"{LOG_PREFIX}: {msg}", file=sys.stderr, flush=True)
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
     try:
-        return bool(ip) and ipaddress.ip_address(ip).is_global
-    except ValueError:
-        return False
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return False
+        return default
 
 
-def safe_get(d, path, default=None):
-    cur = d
-    for key in path:
+def atomic_write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def get_nested(obj, *keys, default=None):
+    cur = obj
+    for k in keys:
         if not isinstance(cur, dict):
             return default
-        cur = cur.get(key)
+        cur = cur.get(k)
         if cur is None:
             return default
     return cur
 
 
-def map_categories(alert):
-    rule_id = str(safe_get(alert, ["rule", "id"], ""))
-    groups = safe_get(alert, ["rule", "groups"], []) or []
-    desc = (safe_get(alert, ["rule", "description"], "") or "").lower()
-
-    if "ssh" in desc or rule_id in {"5710", "5712", "100002", "100003"}:
-        return "18,22"   # Brute-Force + SSH
-    if "sql injection" in desc:
-        return "16"      # SQL Injection
-    if "xss" in desc:
-        return "21"      # Web App Attack
-    if "web" in desc or "wordpress" in desc or "cms" in desc:
-        return "21"      # Web App Attack
-    if "scan" in desc or "recon" in groups:
-        return "14"      # Port Scan
-    if "bot" in desc:
-        return "19"      # Bad Web Bot
-
-    return "15"          # Hacking
+def safe_text(value, default="-", max_len=None):
+    if value is None:
+        text = default
+    else:
+        text = str(value).strip()
+        if not text:
+            text = default
+    if max_len is not None:
+        return text[:max_len]
+    return text
 
 
-def classify_attack_label(alert):
-    rule_id = str(safe_get(alert, ["rule", "id"], ""))
-    groups = safe_get(alert, ["rule", "groups"], []) or []
-    desc = (safe_get(alert, ["rule", "description"], "") or "").lower()
-
-    if "ssh" in desc or rule_id in {"5710", "5712", "100002", "100003"}:
-        return "SSH brute-force activity"
-    if "sql injection" in desc:
-        return "SQL injection attempt"
-    if "xss" in desc:
-        return "Cross-site scripting attempt"
-    if "web" in desc or "wordpress" in desc or "cms" in desc:
-        return "Web application attack"
-    if "scan" in desc or "recon" in groups:
-        return "Port scanning or reconnaissance"
-    if "bot" in desc:
-        return "Bad web bot activity"
-
-    return "Suspicious malicious activity"
+def extract_ioc_value(alert):
+    candidates = [
+        get_nested(alert, "data", "misp", "value"),
+        get_nested(alert, "data", "misp", "ioc"),
+        get_nested(alert, "data", "ioc"),
+        get_nested(alert, "data", "indicator"),
+        get_nested(alert, "data", "match"),
+        get_nested(alert, "data", "eventdata", "misp", "value"),
+        get_nested(alert, "data", "threat", "indicator"),
+        get_nested(alert, "win", "eventdata", "targetObject"),
+        get_nested(alert, "syscheck", "value"),
+        get_nested(alert, "full_log"),
+    ]
+    for item in candidates:
+        if item:
+            return safe_text(item, max_len=300)
+    return "-"
 
 
-def build_comment(alert):
-    return classify_attack_label(alert)[:1024]
+def extract_src_ip(alert):
+    return safe_text(
+        get_nested(alert, "data", "srcip")
+        or get_nested(alert, "data", "src_ip")
+        or get_nested(alert, "srcip"),
+        default="-",
+        max_len=100,
+    )
 
 
-def dedup_key(alert, srcip):
-    rule_id = str(safe_get(alert, ["rule", "id"], "0"))
-    day = datetime.utcnow().strftime("%Y-%m-%d")
-    raw = f"{srcip}|{rule_id}|{day}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+def extract_dst_ip(alert):
+    return safe_text(
+        get_nested(alert, "data", "dstip")
+        or get_nested(alert, "data", "dst_ip")
+        or get_nested(alert, "dstip"),
+        default="-",
+        max_len=100,
+    )
 
 
-def already_reported_today(alert, srcip):
-    path = os.path.join(DEDUP_DIR, dedup_key(alert, srcip))
+def extract_user(alert):
+    return safe_text(
+        get_nested(alert, "data", "user")
+        or get_nested(alert, "data", "username")
+        or get_nested(alert, "win", "eventdata", "targetUserName"),
+        default="-",
+        max_len=150,
+    )
 
-    try:
-        if os.path.exists(path):
-            return True
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(datetime.utcnow().isoformat())
-    except Exception as e:
-        logging.warning("[abuseipdb] Dedup cache issue for %s: %s", srcip, e)
+def build_fingerprint(alert):
+    rule_id = safe_text(get_nested(alert, "rule", "id"), default="unknown")
+    agent_name = safe_text(get_nested(alert, "agent", "name"), default="unknown-agent")
+    src_ip = extract_src_ip(alert)
+    ioc_value = extract_ioc_value(alert)
+    base = f"{rule_id}|{agent_name}|{src_ip}|{ioc_value}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
+
+def dedup_seen_recently(fingerprint, ttl_seconds):
+    now = int(time.time())
+    db = load_json(DEDUP_DB, default={})
+
+    cleaned = {}
+    for k, v in db.items():
+        if isinstance(v, int) and (now - v) < ttl_seconds:
+            cleaned[k] = v
+
+    if fingerprint in cleaned:
+        atomic_write_json(DEDUP_DB, cleaned)
+        return True
+
+    cleaned[fingerprint] = now
+    atomic_write_json(DEDUP_DB, cleaned)
     return False
+
+
+def build_case_name(rule_desc, agent_name, ioc_value, max_len):
+    base = f"[Wazuh][MISP] {ioc_value} on {agent_name}"
+    if ioc_value == "-" or len(base) > max_len:
+        base = f"[Wazuh][MISP] {rule_desc} on {agent_name}"
+    return safe_text(base, max_len=max_len)
+
+
+def build_case_description(alert):
+    rule = alert.get("rule", {})
+    agent = alert.get("agent", {})
+    data = alert.get("data", {})
+
+    rule_id = safe_text(rule.get("id"), default="unknown")
+    rule_desc = safe_text(rule.get("description"), default="No description")
+    level = int(rule.get("level", 0) or 0)
+    wazuh_alert_id = safe_text(alert.get("id"), default="-")
+    ts = safe_text(alert.get("timestamp"), default=datetime.utcnow().isoformat())
+    agent_name = safe_text(agent.get("name"), default="unknown-agent")
+    agent_id = safe_text(agent.get("id"), default="-")
+    src_ip = extract_src_ip(alert)
+    dst_ip = extract_dst_ip(alert)
+    username = extract_user(alert)
+    ioc_value = extract_ioc_value(alert)
+    groups = rule.get("groups", [])
+    if not isinstance(groups, list):
+        groups = [safe_text(groups)]
+
+    short = (
+        f"MISP IOC hit detected by Wazuh on {agent_name}. "
+        f"IOC={ioc_value}; src_ip={src_ip}; user={username}; "
+        f"rule_id={rule_id}; alert_id={wazuh_alert_id}"
+    )
+
+    details = {
+        "summary": short,
+        "timestamp": ts,
+        "wazuh_alert_id": wazuh_alert_id,
+        "rule_id": rule_id,
+        "rule_description": rule_desc,
+        "rule_level": level,
+        "rule_groups": groups,
+        "agent_name": agent_name,
+        "agent_id": agent_id,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "user": username,
+        "ioc_value": ioc_value,
+        "data": data,
+    }
+
+    return (
+        short
+        + "\n\n"
+        + "Raw context:\n"
+        + "```json\n"
+        + json.dumps(details, ensure_ascii=False, indent=2)
+        + "\n```"
+    )
+
+
+def post_json(url, headers, payload, verify_ssl):
+    r = requests.post(url, headers=headers, json=payload, timeout=30, verify=verify_ssl)
+    if not r.ok:
+        raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
+    try:
+        return r.json()
+    except Exception:
+        return {"raw_text": r.text}
+
+
+def parse_options(argv):
+    options = {}
+    if len(argv) > 4:
+        try:
+            options = json.loads(argv[4])
+        except Exception as e:
+            log(f"Failed to parse options JSON: {e}")
+    return options
 
 
 def main():
     if len(sys.argv) < 4:
-        logging.error("[abuseipdb] Usage: custom-abuseipdb-report <alert_file> <api_key> <hook_url>")
+        log("Usage: custom-dfir_iris <alert_file> <api_key> <hook_url> [options_json]")
         sys.exit(1)
 
     alert_file = sys.argv[1]
     api_key = sys.argv[2]
-    hook_url = sys.argv[3]
+    base_url = sys.argv[3].rstrip("/")
+    options = parse_options(sys.argv)
 
-    try:
-        with open(alert_file, "r", encoding="utf-8") as f:
-            alert = json.load(f)
-    except Exception as e:
-        logging.error("[abuseipdb] Failed to read alert file: %s", e)
+    customer_id = int(options.get("customer_id", 1))
+    cid = int(options.get("cid", 1))
+    verify_ssl = bool(options.get("verify_ssl", False))
+    dedup_seconds = int(options.get("dedup_seconds", 1800))
+    max_case_name_len = int(options.get("max_case_name_len", 180))
+
+    alert = load_json(alert_file, default={})
+    if not alert:
+        log("Alert JSON empty or unreadable")
         sys.exit(1)
 
-    srcip = safe_get(alert, ["data", "srcip"]) or safe_get(alert, ["srcip"])
-    if not is_public_ip(srcip):
-        logging.info("[abuseipdb] Skipping non-public or invalid IP: %s", srcip)
+    rule_id = safe_text(get_nested(alert, "rule", "id"), default="unknown")
+    if rule_id not in ALLOWED_RULE_IDS:
+        log(f"Skipping unsupported rule_id={rule_id}")
         sys.exit(0)
 
-    if already_reported_today(alert, srcip):
-        logging.info(
-            "[abuseipdb] Duplicate report skipped for ip=%s rule_id=%s",
-            srcip,
-            safe_get(alert, ["rule", "id"], "N/A")
-        )
+    fingerprint = build_fingerprint(alert)
+    if dedup_seen_recently(fingerprint, dedup_seconds):
+        log(f"Duplicate suppressed: {fingerprint}")
         sys.exit(0)
 
-    categories = map_categories(alert)
-    comment = build_comment(alert)
+    rule_desc = safe_text(get_nested(alert, "rule", "description"), default="No description", max_len=120)
+    agent_name = safe_text(get_nested(alert, "agent", "name"), default="unknown-agent", max_len=100)
+    ioc_value = extract_ioc_value(alert)
+    wazuh_alert_id = safe_text(alert.get("id"), default=f"{rule_id}-{int(time.time())}")
+
+    case_payload = {
+        "case_soc_id": wazuh_alert_id,
+        "case_customer": customer_id,
+        "case_name": build_case_name(rule_desc, agent_name, ioc_value, max_case_name_len),
+        "case_description": build_case_description(alert),
+    }
 
     headers = {
-        "Key": api_key,
-        "Accept": "application/json"
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
-    data = {
-        "ip": srcip,
-        "categories": categories,
-        "comment": comment
-    }
-
-    logging.info(
-        "[abuseipdb] Reporting ip=%s categories=%s rule_id=%s comment=%s",
-        srcip,
-        categories,
-        safe_get(alert, ["rule", "id"], "N/A"),
-        comment
-    )
+    case_url = f"{base_url}/manage/cases/add?cid={cid}"
 
     try:
-        resp = requests.post(hook_url, headers=headers, data=data, timeout=15)
-        logging.info("[abuseipdb] Response status=%s body=%s", resp.status_code, resp.text)
+        log(f"Creating case for rule_id={rule_id} alert_id={wazuh_alert_id}")
+        resp = post_json(case_url, headers, case_payload, verify_ssl)
+        log(f"IRIS response: {json.dumps(resp, ensure_ascii=False)}")
 
-        if resp.status_code in (200, 201):
-            logging.info("[abuseipdb] Reported IP %s successfully", srcip)
-        else:
-            logging.error(
-                "[abuseipdb] Failed reporting IP %s. Status=%s Body=%s",
-                srcip,
-                resp.status_code,
-                resp.text
-            )
+        status = safe_text(resp.get("status"), default="").lower()
+        data = resp.get("data", {}) if isinstance(resp.get("data"), dict) else {}
+        case_id = data.get("case_id")
+
+        if status != "success" or not case_id:
+            log("Create case response did not return success/case_id")
             sys.exit(1)
 
+        log(f"Case created successfully. case_id={case_id}")
+        sys.exit(0)
+
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "unknown")
+        body = getattr(e.response, "text", "")
+        log(f"HTTP error status={code} body={body}")
+        sys.exit(1)
     except Exception as e:
-        logging.exception("[abuseipdb] Exception reporting IP %s: %s", srcip, e)
+        log(f"Unhandled error: {e}")
         sys.exit(1)
 
 
