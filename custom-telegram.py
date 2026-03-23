@@ -15,20 +15,11 @@ except Exception:
 CHAT_ID = "<chat-id>"
 
 def extract_ip(description):
-    """
-    Fungsi untuk mengekstrak alamat IP dari log.
-    Menggunakan regex untuk mencari pola IP address.
-    """
     ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
     ip_match = re.search(ip_pattern, description)
     return ip_match.group(0) if ip_match else 'N/A'
 
 def extract_domain(description):
-    """
-    Fungsi untuk mengekstrak domain atau host dari log.
-    Menggunakan regex untuk mencari pola domain/host dari log.
-    Regex akan mencari domain yang memiliki format URL yang valid.
-    """
     domain_pattern = r'(?:(?:https?|ftp):\/\/)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
     domain_match = re.search(domain_pattern, description)
     return domain_match.group(1) if domain_match else 'Unknown target'
