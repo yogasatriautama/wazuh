@@ -3,7 +3,7 @@
   <rule id="500500" level="12">
     <if_sid>554</if_sid>
     <field name="file" type="pcre2">(?i).php$|.phtml$|.php3$|.php4$|.php5$|.phps$|.phar$|.asp$|.aspx$|.jsp$|.cshtml$|.vbhtml$</field>
-    <description>[File creation]: Possible web shell scripting file ($(file)) created</description>
+    <description>[File creation]: Scripting file ($(file)) created</description>
     <mitre>
       <id>T1105</id>
       <id>T1505</id>
