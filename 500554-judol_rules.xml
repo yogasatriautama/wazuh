@@ -1,6 +1,6 @@
 <!-- Rules for judol detection -->
 <group name="ossec,syscheck,">
-  <!-- This rule detects file creation on web directory -->
+  <!-- This rule detects file creation on web directory, delete this, if your use rule 500500  -->
   <rule id="500554" level="12">
     <if_sid>554</if_sid>
     <field name="file" type="pcre2">(?i)public|www|html</field>
