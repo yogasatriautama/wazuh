@@ -1,10 +1,10 @@
 <!-- Rules for judol detection -->
 <group name="ossec,syscheck,">
-  <!-- This rule detects file creation on web directory, disable this rule if you apply 500500 rules -->
+  <!-- This rule detects file creation on web directory -->
   <rule id="500554" level="12">
     <if_sid>554</if_sid>
     <field name="file" type="pcre2">(?i)public|www|html</field>
-    <description>[File creation on web directory]: New file $(file) on web directory</description>
+    <description>[File creation on web directory]: New file created in web directory: $(file)</description>
     <group>syscheck_entry_added,syscheck_file</group>
 	<mitre>
       <id>T1105</id>
